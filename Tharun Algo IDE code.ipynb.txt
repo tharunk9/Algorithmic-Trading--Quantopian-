@@ -1,0 +1,186 @@
+import numpy as np
+import pandas as pd
+from quantopian.pipeline import Pipeline
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.domain import US_EQUITIES
+from quantopian.pipeline.filters import QTradableStocksUS, AtLeastN
+from quantopian.pipeline.data import morningstar
+from quantopian.pipeline.factors import CustomFactor, BusinessDaysSincePreviousEvent, AverageDollarVolume, DailyReturns,MarketCap, MaxDrawdown
+from quantopian.pipeline.data.factset import Fundamentals
+from quantopian.pipeline.data.factset.estimates import PeriodicConsensus
+import quantopian.pipeline.data.factset.estimates as fe
+from quantopian.pipeline.data import EquityPricing as ep
+
+
+def make_pipeline(context):
+    # Create our pipeline  
+    pipe = Pipeline()  
+    
+    stocks = morningstar.valuation.market_cap.latest.top(500)
+    base_universe = QTradableStocksUS()
+    
+    #giving the slack of 65 days so it would not keep changing constantly
+    universe=AtLeastN(inputs=[stocks],
+                       window_length=70,
+                       N=65,) & base_universe
+    
+    # Earnings per Share consensus and Acutals
+    eps_cons = fe.PeriodicConsensus.slice('EPS', 'qf', 0)
+    eps_act = fe.Actuals.slice('EPS', 'qf', 0)
+
+    #latest 'mean' consensus EPS estimate for the last reported quarter.
+    eps_cons_mean = eps_cons.mean.latest
+
+    #Actual EPS value from the last reported quarter.
+    eps_act_value = eps_act.actual_value.latest
+
+    q_earnings_date= Fundamentals.eps_rpt_date_qf.latest 
+
+    #surprise factor to be the relative difference between the estimated and
+    surprise = (eps_act_value - eps_cons_mean) / ep.open.latest
+    
+    #Declares the tresholds for longs and shorts
+    higher_surprise = 10
+    lower_surprise = -9
+    
+    context.longs= (surprise*1000) >= higher_surprise
+    context.shorts= (surprise*1000) <= lower_surprise
+
+ 
+    # Add the surprise factor to the pipeline.
+    pipe = Pipeline(
+        columns={
+            'Earnings_Date': q_earnings_date,
+            'eps_cons_mean': eps_cons_mean,
+            'eps_act_value': eps_act_value,
+            'eps_surprise_factor': surprise*1000
+            
+        },
+        domain=US_EQUITIES,
+        screen=universe & surprise.notnull() & surprise.notnan() & q_earnings_date.notnull() 
+        
+    )    
+    context.days_since_earnings = BusinessDaysSincePreviousEvent(
+                          inputs=[Fundamentals.eps_rpt_date_qf]
+                        )
+    
+    #giving an error while adding to the pipe(from notebook error)
+    pipe.add(context.days_since_earnings, "days_since_earnings")
+    pipe.add(context.longs, "longs")
+    pipe.add(context.shorts, "shorts")  
+                  
+    return pipe 
+
+
+def initialize(context):
+    """
+    Called once at the start of the algorithm.
+    """
+    
+    #: Set commissions and slippage to 0 to determine pure alpha
+    set_commission(commission.PerShare(cost=0, min_trade_cost=0))
+    set_slippage(slippage.FixedSlippage(spread=0))
+
+    #: Declaring the days to hold
+    context.days_to_hold = 61
+    #: Declares which stocks we currently held and how many days we've held them dict[stock:days_held]
+    context.stocks_held = {}
+
+    #make and call our pipeline
+    attach_pipeline(make_pipeline(context), 'earnings')
+    
+   
+    # Order our positions
+    schedule_function(func=order_positions,
+                      date_rule=date_rules.every_day(),
+                      time_rule=time_rules.market_open())
+                      
+def before_trading_start(context, data):
+    """
+    Called every day before market open.
+    """
+    results = pipeline_output('earnings')
+    #filter and create a new data frame where the days passed for earnings ==1
+    results = results[results['days_since_earnings'] == 2]
+    
+    #get the new df index
+    assets_in_universe = results.index
+    
+    #assign the variables accordingly
+    context.positive_surprise = assets_in_universe[results.longs]
+    context.negative_surprise = assets_in_universe[results.shorts]
+
+def order_positions(context, data):
+       
+    #get the positions in the portfolio
+    port = context.portfolio.positions
+    
+    #track leverage
+    record(leverage=context.account.leverage)
+
+    ## Check if positions are exited and if not, exit the remaining securities
+    for security in port:  
+        if data.can_trade(security):  
+            
+            #counter for days
+            context.stocks_held[security] += context.stocks_held.get(security, 0) + 1
+            
+                
+            #exit position after fixed number of days(60 days)
+            if context.stocks_held.get(security, 0) >= context.days_to_hold:
+                    
+                order_target_percent(security, 0)  
+                context.stocks_held.pop(security, None)
+                    
+                    
+            # If we've deleted it but it still hasn't been exited. Try exiting again(extra layer)
+            else:  
+                log.info("Haven't yet exited %s, ordering again" % security.symbol)  
+                order_target_percent(security, 0)  
+
+    ## Check our current positions
+    current_positive_pos = [pos for pos in port if (port[pos].amount > 0 and pos in context.stocks_held)]
+    
+    current_negative_pos = [pos for pos in port if (port[pos].amount < 0 and pos in context.stocks_held)]
+   
+    
+    negative_stocks = context.negative_surprise.tolist() + current_negative_pos
+    positive_stocks = context.positive_surprise.tolist() + current_positive_pos
+    
+    ## Rebalance our negative surprise securities (existing + new)
+    for security in negative_stocks:
+        can_trade = context.stocks_held.get(security, 0) <= context.days_to_hold
+     
+        #
+        if data.can_trade(security) and can_trade:
+            order_target_percent(security, -1.0 / len(negative_stocks))
+            
+            #
+            context.stocks_held[security] =  context.stocks_held.get(security, 0)
+
+    # Rebalance our positive surprise securities (existing + new)                
+    for security in positive_stocks:
+       can_trade = context.stocks_held.get(security, 0) <= context.days_to_hold
+        
+        
+       if data.can_trade(security) and can_trade:
+            order_target_percent(security, 1.0 / len(positive_stocks))
+            
+            context.stocks_held[security] = context.stocks_held.get(security, 0)
+
+
+def log_positions(context, data):
+    '''Function to log our positions'''
+    
+    #Get all positins and amount
+    if len(context.portfolio.positions) > 0:  
+        all_positions = "Current positions for %s : " % (str(get_datetime()))  
+        
+        #track the amount
+        for pos in context.portfolio.positions:  
+            # displays amount for position(filter to clear 0 amount position)
+            if context.portfolio.positions[pos].amount != 0:  
+                all_positions += "%s at %s shares, " % (pos.symbol, context.portfolio.positions[pos].amount)  
+        
+        log.info(all_positions)
